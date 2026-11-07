@@ -2,7 +2,7 @@
   "name": "vscode-nonebot-locales-viewer",
   "displayName": "Nonebot2Locales Viewer",
   "description": "Supports displaying a preview of the multilingual support keys for nonebot-plugins-locales.",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "engines": {
     "vscode": "^1.145.0"
   },
@@ -10,7 +10,7 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onLanguage:python"
   ],
   "main": "./out/extension.js",
   "dependencies": {

@@ -19,16 +19,40 @@ class LocalePreviewManager implements vscode.Disposable {
 	private readonly languageStatus = vscode.window.createStatusBarItem('nonebotLocalesViewer.language', vscode.StatusBarAlignment.Right, 100);
 	private readonly disposables: vscode.Disposable[] = [];
 	private readonly detectedLocaleDirectories = new Map<string, string | undefined>();
+	private readonly localeCache = new Map<string, { mtimeMs: number; data: LocaleData }>();
+	private refreshTimer: NodeJS.Timeout | undefined;
 
 	constructor(private readonly context: vscode.ExtensionContext) {
 		this.languageStatus.command = 'nonebotLocalesViewer.selectLanguage';
 		this.languageStatus.tooltip = 'NoneBot2 Locales Viewer: Select preview language';
 		const watcher = vscode.workspace.createFileSystemWatcher('**/*.{yaml,yml}');
-		this.disposables.push(watcher, watcher.onDidChange(() => this.refresh()), watcher.onDidCreate(() => this.refresh()), watcher.onDidDelete(() => this.refresh()), vscode.window.onDidChangeActiveTextEditor(() => this.refresh()), vscode.window.onDidChangeTextEditorVisibleRanges(() => this.refresh()), vscode.window.onDidChangeTextEditorSelection((event) => this.updateEditor(event.textEditor)), vscode.workspace.onDidChangeTextDocument((event) => this.onDocumentChanged(event)), vscode.workspace.onDidChangeConfiguration((event) => { if (event.affectsConfiguration('nonebotLocalesViewer')) {this.detectedLocaleDirectories.clear(); this.refresh();} }));
+		this.disposables.push(
+			watcher,
+			watcher.onDidChange(() => { this.clearLocaleCache(); this.scheduleRefresh(); }),
+			watcher.onDidCreate(() => { this.clearLocaleCache(); this.scheduleRefresh(); }),
+			watcher.onDidDelete(() => { this.clearLocaleCache(); this.scheduleRefresh(); }),
+			vscode.window.onDidChangeActiveTextEditor(() => this.scheduleRefresh()),
+			vscode.window.onDidChangeTextEditorVisibleRanges(() => this.scheduleRefresh()),
+			vscode.window.onDidChangeTextEditorSelection((event) => this.updateEditor(event.textEditor)),
+			vscode.workspace.onDidChangeTextDocument((event) => this.onDocumentChanged(event)),
+			vscode.workspace.onDidSaveTextDocument((document) => {
+				if (document.languageId === 'python') {this.detectedLocaleDirectories.clear(); this.scheduleRefresh();}
+			}),
+			vscode.workspace.onDidChangeConfiguration((event) => {
+				if (event.affectsConfiguration('nonebotLocalesViewer')) {this.detectedLocaleDirectories.clear(); this.clearLocaleCache(); this.scheduleRefresh();}
+			}),
+		);
 	}
 
 	refresh(): void { for (const editor of vscode.window.visibleTextEditors) {this.updateEditor(editor);} this.updateLanguageStatus(vscode.window.activeTextEditor); }
-	private onDocumentChanged(event: vscode.TextDocumentChangeEvent): void { if (event.document.languageId === 'python' || /\.ya?ml$/i.test(event.document.fileName)) {this.detectedLocaleDirectories.clear(); this.refresh();} }
+	scheduleRefresh(): void {
+		if (this.refreshTimer) {clearTimeout(this.refreshTimer);}
+		this.refreshTimer = setTimeout(() => { this.refreshTimer = undefined; this.refresh(); }, 200);
+	}
+	private clearLocaleCache(): void { this.localeCache.clear(); }
+	private onDocumentChanged(event: vscode.TextDocumentChangeEvent): void {
+		if (event.document.languageId === 'python' || /\.ya?ml$/i.test(event.document.fileName)) {this.scheduleRefresh();}
+	}
 
 	private updateEditor(editor: vscode.TextEditor): void {
 		if (editor.document.languageId !== 'python') { editor.setDecorations(this.inlineDecoration, []); editor.setDecorations(this.afterDecoration, []); return; }
@@ -100,13 +124,13 @@ class LocalePreviewManager implements vscode.Disposable {
 	}
 	private detectLocaleDirectoryNearFile(file: string, workspaceFolder: string): string | undefined {
 		let directory = path.dirname(file);
-		while (directory.startsWith(workspaceFolder)) {
+		while (isPathInside(directory, workspaceFolder)) {
 			const files = this.pythonFilesIn(directory, file);
 			for (const candidate of files) {
 				const localeDirectory = this.detectLocaleDirectoryInFile(candidate);
 				if (localeDirectory) {return localeDirectory;}
 			}
-			if (directory === workspaceFolder) {break;}
+			if (path.relative(workspaceFolder, directory) === '') {break;}
 			directory = path.dirname(directory);
 		}
 		return undefined;
@@ -141,8 +165,25 @@ class LocalePreviewManager implements vscode.Disposable {
 		return undefined;
 	}
 	private readLocale(directory: string, language: string): LocaleData {
-		const base = LANGUAGE_ALIASES[language.replace('-', '_')] ?? language.replace('-', '_');
-		for (const extension of ['.yaml', '.yml']) {try { const value = yaml.load(require('node:fs').readFileSync(path.join(directory, `${base}${extension}`), 'utf8')); if (value && typeof value === 'object' && !Array.isArray(value)) {return value as LocaleData;} } catch { /* locale may not exist */ }}
+		const normalized = language.replace('-', '_');
+		const bases = [...new Set([normalized, LANGUAGE_ALIASES[normalized]].filter((value): value is string => Boolean(value)))];
+		for (const base of bases) {
+			for (const extension of ['.yaml', '.yml']) {
+				const file = path.join(directory, `${base}${extension}`);
+				let mtimeMs: number;
+				try { mtimeMs = fs.statSync(file).mtimeMs; } catch { continue; }
+				const cached = this.localeCache.get(file);
+				if (cached && cached.mtimeMs === mtimeMs) {return cached.data;}
+				try {
+					const value = yaml.load(fs.readFileSync(file, 'utf8'));
+					if (value && typeof value === 'object' && !Array.isArray(value)) {
+						const data = value as LocaleData;
+						this.localeCache.set(file, { mtimeMs, data });
+						return data;
+					}
+				} catch { /* locale may not exist */ }
+			}
+		}
 		return {};
 	}
 	private findKeys(document: vscode.TextDocument, functions: string[]): Array<{ range: vscode.Range; key: string }> {
@@ -157,7 +198,7 @@ class LocalePreviewManager implements vscode.Disposable {
 		if (Array.isArray(value) && value.every((item) => typeof item === 'string')) {return value[0];}
 		return undefined;
 	}
-	dispose(): void { this.inlineDecoration.dispose(); this.afterDecoration.dispose(); this.languageStatus.dispose(); for (const disposable of this.disposables) {disposable.dispose();} }
+	dispose(): void { if (this.refreshTimer) {clearTimeout(this.refreshTimer); this.refreshTimer = undefined;} this.inlineDecoration.dispose(); this.afterDecoration.dispose(); this.languageStatus.dispose(); for (const disposable of this.disposables) {disposable.dispose();} }
 }
 
 function findPythonCallArguments(source: string, functionName: string): string[] {
@@ -314,6 +355,12 @@ function comparePathProximity(currentFile: string, leftFile: string, rightFile: 
 }
 
 function escapeRegExp(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+function isPathInside(child: string, parent: string): boolean {
+	const relative = path.relative(parent, child);
+	if (relative === '') {return true;}
+	return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
 
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
